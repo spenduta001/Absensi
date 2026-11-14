@@ -1414,6 +1414,7 @@
                 if (Array.isArray(parsed.attendance)) {
                     AppState.attendance = parsed.attendance.map(a => ({
                         ...a,
+                        date: normalizeDateYYYYMMDD(a.date),
                         timeIn: normalizeHHMM(a.timeIn, ''),
                         timeOut: normalizeHHMM(a.timeOut, '')
                     }));
@@ -1509,18 +1510,45 @@
                         }));
                     }
                     if (Array.isArray(json.attendance)) {
-                        AppState.attendance = json.attendance.map(a => ({
+                        const remoteAtt = json.attendance.map(a => ({
                             ...a,
-                            date: String(a.date || '').slice(0, 10),
+                            id: String(a.id || '').trim(),
+                            userId: String(a.userId || '').trim(),
+                            date: normalizeDateYYYYMMDD(a.date),
                             timeIn: normalizeHHMM(a.timeIn, ''),
                             timeOut: normalizeHHMM(a.timeOut, '')
                         }));
+                        // Merge with any local records not yet reflected in remote sheet
+                        const mergedMap = new Map();
+                        AppState.attendance.forEach(localRec => {
+                            if (localRec && localRec.id) mergedMap.set(String(localRec.id), localRec);
+                        });
+                        remoteAtt.forEach(remRec => {
+                            if (!remRec || !remRec.id) return;
+                            const existingLocal = mergedMap.get(remRec.id);
+                            // Keep local base64 photos if remote sheet stored placeholder
+                            if (existingLocal) {
+                                if ((!remRec.photoIn || String(remRec.photoIn).startsWith('[FOTO_')) && existingLocal.photoIn) {
+                                    remRec.photoIn = existingLocal.photoIn;
+                                }
+                                if ((!remRec.photoOut || String(remRec.photoOut).startsWith('[FOTO_')) && existingLocal.photoOut) {
+                                    remRec.photoOut = existingLocal.photoOut;
+                                }
+                                // If local has timeOut recorded just now and remote hasn't updated yet, keep local timeOut
+                                if (!remRec.timeOut && existingLocal.timeOut) {
+                                    remRec.timeOut = existingLocal.timeOut;
+                                    remRec.status = existingLocal.status;
+                                }
+                            }
+                            mergedMap.set(remRec.id, remRec);
+                        });
+                        AppState.attendance = Array.from(mergedMap.values());
                     }
                     if (Array.isArray(json.leaves)) {
                         AppState.leaves = json.leaves.map(l => ({
                             ...l,
-                            startDate: String(l.startDate || '').slice(0, 10),
-                            endDate: String(l.endDate || '').slice(0, 10)
+                            startDate: normalizeDateYYYYMMDD(l.startDate),
+                            endDate: normalizeDateYYYYMMDD(l.endDate)
                         }));
                     }
                     if (Array.isArray(json.auditLogs)) {
@@ -1691,10 +1719,15 @@
                             sanitizedData[field] = '[FOTO_TERVERIFIKASI_LOKAL]';
                         }
                     });
-                    // Prefix HH:MM time strings with apostrophe so Google Sheets stores them as plain text instead of 1899 Date objects
+                    // Prefix HH:MM time strings and YYYY-MM-DD dates with apostrophe so Google Sheets stores them as plain text without UTC shift
                     ['timeIn', 'timeOut'].forEach(tField => {
                         if (typeof sanitizedData[tField] === 'string' && /^\d{1,2}:\d{2}$/.test(sanitizedData[tField])) {
                             sanitizedData[tField] = "'" + sanitizedData[tField];
+                        }
+                    });
+                    ['date', 'startDate', 'endDate'].forEach(dField => {
+                        if (typeof sanitizedData[dField] === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(sanitizedData[dField])) {
+                            sanitizedData[dField] = "'" + sanitizedData[dField];
                         }
                     });
 
@@ -1931,6 +1964,9 @@
             } else {
                 refreshGPSLocation();
                 switchView('pegawai-home');
+            }
+            if (AppState.settings.googleSheetApiUrl) {
+                syncFromGoogleSheets(false);
             }
         }
 
@@ -3095,6 +3131,31 @@
         }
 
         // ==================== SCHOOL SETTINGS & AUDIT LOGS ====================
+        window.normalizeDateYYYYMMDD = function(val) {
+            if (!val) return '';
+            const str = String(val).trim().replace(/^'/, '');
+            // Pure YYYY-MM-DD
+            if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+            // ISO string from Google Sheets Date cell (e.g. "2026-11-13T17:00:00.000Z" which is 2026-11-14 00:00 WIB)
+            if (str.includes('T') || str.includes('GMT')) {
+                const d = new Date(str);
+                if (!isNaN(d.getTime())) {
+                    // Shift to Asia/Jakarta (+07:00)
+                    const jakartaDate = new Date(d.getTime() + (7 * 60 * 60 * 1000));
+                    const y = jakartaDate.getUTCFullYear();
+                    const m = String(jakartaDate.getUTCMonth() + 1).padStart(2, '0');
+                    const day = String(jakartaDate.getUTCDate()).padStart(2, '0');
+                    return `${y}-${m}-${day}`;
+                }
+            }
+            // DD/MM/YYYY fallback
+            const dmy = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+            if (dmy) {
+                return `${dmy[3]}-${String(dmy[2]).padStart(2, '0')}-${String(dmy[1]).padStart(2, '0')}`;
+            }
+            return str.slice(0, 10);
+        };
+
         window.normalizeHHMM = function(val, fallback = '') {
             if (val === null || val === undefined || val === '' || val === '-') return val === '-' ? '-' : fallback;
             const str = String(val).trim();
