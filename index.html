@@ -1390,7 +1390,7 @@
 
         window.saveLocalCache = function() {
             try {
-                localStorage.setItem(LS_KEY_CACHE, JSON.stringify({
+                localStorage.setItem(window.LS_KEY_CACHE, JSON.stringify({
                     settings: AppState.settings,
                     users: AppState.users,
                     attendance: AppState.attendance,
@@ -1402,12 +1402,22 @@
 
         window.loadLocalCache = function() {
             try {
-                const raw = localStorage.getItem(LS_KEY_CACHE);
+                const raw = localStorage.getItem(window.LS_KEY_CACHE);
                 if (!raw) return false;
                 const parsed = JSON.parse(raw);
-                if (parsed.settings) AppState.settings = { ...AppState.settings, ...parsed.settings };
+                if (parsed.settings) {
+                    AppState.settings = { ...AppState.settings, ...parsed.settings };
+                    AppState.settings.timeIn = normalizeHHMM(AppState.settings.timeIn, '07:00');
+                    AppState.settings.timeOut = normalizeHHMM(AppState.settings.timeOut, '14:00');
+                }
                 if (Array.isArray(parsed.users) && parsed.users.length) AppState.users = parsed.users;
-                if (Array.isArray(parsed.attendance)) AppState.attendance = parsed.attendance;
+                if (Array.isArray(parsed.attendance)) {
+                    AppState.attendance = parsed.attendance.map(a => ({
+                        ...a,
+                        timeIn: normalizeHHMM(a.timeIn, ''),
+                        timeOut: normalizeHHMM(a.timeOut, '')
+                    }));
+                }
                 if (Array.isArray(parsed.leaves)) AppState.leaves = parsed.leaves;
                 if (Array.isArray(parsed.auditLogs)) AppState.auditLogs = parsed.auditLogs;
                 return true;
@@ -1471,7 +1481,7 @@
                 return false;
             }
             AppState.settings.googleSheetApiUrl = candidateUrl;
-            localStorage.setItem(LS_KEY_URL, candidateUrl);
+            localStorage.setItem(window.LS_KEY_URL, candidateUrl);
             const url = candidateUrl;
             try {
                 const res = await fetch(`${url}?action=getAll&t=${Date.now()}`);
@@ -1482,6 +1492,12 @@
                         if (!incomingSettings.logoUrl || String(incomingSettings.logoUrl).startsWith('[FOTO_')) {
                             incomingSettings.logoUrl = AppState.settings.logoUrl || '';
                         }
+                        if (incomingSettings.timeIn) incomingSettings.timeIn = normalizeHHMM(incomingSettings.timeIn, AppState.settings.timeIn);
+                        if (incomingSettings.timeOut) incomingSettings.timeOut = normalizeHHMM(incomingSettings.timeOut, AppState.settings.timeOut);
+                        if (incomingSettings.toleranceMinutes !== undefined) incomingSettings.toleranceMinutes = Number(incomingSettings.toleranceMinutes);
+                        if (incomingSettings.gpsLat !== undefined) incomingSettings.gpsLat = Number(String(incomingSettings.gpsLat).replace(',', '.'));
+                        if (incomingSettings.gpsLng !== undefined) incomingSettings.gpsLng = Number(String(incomingSettings.gpsLng).replace(',', '.'));
+                        if (incomingSettings.gpsRadius !== undefined) incomingSettings.gpsRadius = Number(incomingSettings.gpsRadius);
                         AppState.settings = { ...AppState.settings, ...incomingSettings, googleSheetApiUrl: url };
                     }
                     if (Array.isArray(json.users) && json.users.length > 0) {
@@ -1496,8 +1512,8 @@
                         AppState.attendance = json.attendance.map(a => ({
                             ...a,
                             date: String(a.date || '').slice(0, 10),
-                            timeIn: String(a.timeIn || ''),
-                            timeOut: String(a.timeOut || '')
+                            timeIn: normalizeHHMM(a.timeIn, ''),
+                            timeOut: normalizeHHMM(a.timeOut, '')
                         }));
                     }
                     if (Array.isArray(json.leaves)) {
@@ -1536,7 +1552,7 @@
                 return;
             }
             AppState.settings.googleSheetApiUrl = val;
-            localStorage.setItem(LS_KEY_URL, val);
+            localStorage.setItem(window.LS_KEY_URL, val);
             saveLocalCache();
             updateGSheetStatusBadge();
             closeModal('gsheet-setup-modal');
@@ -1546,7 +1562,7 @@
 
         window.disconnectGoogleSheet = function() {
             AppState.settings.googleSheetApiUrl = '';
-            localStorage.removeItem(LS_KEY_URL);
+            localStorage.removeItem(window.LS_KEY_URL);
             saveLocalCache();
             updateGSheetStatusBadge();
             closeModal('gsheet-setup-modal');
@@ -1562,7 +1578,7 @@
             AppState.auditLogs = seed.defaultLogs;
 
             loadLocalCache();
-            const savedUrl = localStorage.getItem(LS_KEY_URL);
+            const savedUrl = localStorage.getItem(window.LS_KEY_URL);
             AppState.settings.googleSheetApiUrl = savedUrl || 'https://script.google.com/macros/s/AKfycbzsDxYC6unkKfW8aEwUDXZ_-ilQYhOEp0ED4uZ6FCJXWa_AKxVcfChV4zEgbZiUitzaGw/exec';
             updateGSheetStatusBadge();
 
@@ -1673,6 +1689,12 @@
                     ['photo', 'photoIn', 'photoOut', 'attachment', 'logoUrl'].forEach(field => {
                         if (typeof sanitizedData[field] === 'string' && sanitizedData[field].length > 45000) {
                             sanitizedData[field] = '[FOTO_TERVERIFIKASI_LOKAL]';
+                        }
+                    });
+                    // Prefix HH:MM time strings with apostrophe so Google Sheets stores them as plain text instead of 1899 Date objects
+                    ['timeIn', 'timeOut'].forEach(tField => {
+                        if (typeof sanitizedData[tField] === 'string' && /^\d{1,2}:\d{2}$/.test(sanitizedData[tField])) {
+                            sanitizedData[tField] = "'" + sanitizedData[tField];
                         }
                     });
 
@@ -3073,15 +3095,33 @@
         }
 
         // ==================== SCHOOL SETTINGS & AUDIT LOGS ====================
-        function normalizeHHMM(val, fallback) {
-            if (!val) return fallback;
+        window.normalizeHHMM = function(val, fallback = '') {
+            if (val === null || val === undefined || val === '' || val === '-') return val === '-' ? '-' : fallback;
             const str = String(val).trim();
-            const match = str.match(/(\d{1,2}):(\d{2})/);
-            if (match) {
-                return `${String(match[1]).padStart(2, '0')}:${match[2]}`;
+            // Case 1: Pure HH:MM or HH:MM:SS string (e.g. "07:00" or "7:05:00")
+            const pureMatch = str.match(/^'?(\d{1,2}):(\d{2})(?::\d{2})?$/);
+            if (pureMatch) {
+                return `${String(pureMatch[1]).padStart(2, '0')}:${pureMatch[2]}`;
+            }
+            // Case 2: ISO Date string or JS Date string returned by Google Sheets for Time cells (e.g. "1899-12-30T00:00:00.000Z")
+            if (str.includes('T') || str.includes('GMT') || str.includes('1899') || str.includes('1900')) {
+                const parsedDate = new Date(str);
+                if (!isNaN(parsedDate.getTime())) {
+                    if (parsedDate.getUTCFullYear() <= 1905) {
+                        const jakartaMs = parsedDate.getTime() + (7 * 60 * 60 * 1000);
+                        const jDate = new Date(jakartaMs);
+                        return `${String(jDate.getUTCHours()).padStart(2, '0')}:${String(jDate.getUTCMinutes()).padStart(2, '0')}`;
+                    }
+                    return `${String(parsedDate.getHours()).padStart(2, '0')}:${String(parsedDate.getMinutes()).padStart(2, '0')}`;
+                }
+            }
+            // Case 3: Fallback regex
+            const fallbackMatch = str.match(/(\d{1,2}):(\d{2})/);
+            if (fallbackMatch) {
+                return `${String(fallbackMatch[1]).padStart(2, '0')}:${fallbackMatch[2]}`;
             }
             return fallback;
-        }
+        };
 
         function renderSchoolSettingsForm() {
             const s = AppState.settings;
@@ -3209,9 +3249,9 @@
                 });
 
                 if (AppState.settings.googleSheetApiUrl) {
-                    localStorage.setItem(LS_KEY_URL, AppState.settings.googleSheetApiUrl);
+                    localStorage.setItem(window.LS_KEY_URL, AppState.settings.googleSheetApiUrl);
                 } else {
-                    localStorage.removeItem(LS_KEY_URL);
+                    localStorage.removeItem(window.LS_KEY_URL);
                 }
 
                 await persistEntity('school_config', 'main', AppState.settings);
