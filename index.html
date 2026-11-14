@@ -1490,8 +1490,11 @@
                 if (json && json.status === 'success') {
                     if (json.settings && Object.keys(json.settings).length > 0) {
                         const incomingSettings = { ...json.settings };
-                        if (!incomingSettings.logoUrl || String(incomingSettings.logoUrl).startsWith('[FOTO_')) {
-                            incomingSettings.logoUrl = AppState.settings.logoUrl || '';
+                        const cleanedIncomingLogo = normalizeLogoUrl(incomingSettings.logoUrl);
+                        if (!cleanedIncomingLogo) {
+                            incomingSettings.logoUrl = normalizeLogoUrl(AppState.settings.logoUrl);
+                        } else {
+                            incomingSettings.logoUrl = cleanedIncomingLogo;
                         }
                         if (incomingSettings.timeIn) incomingSettings.timeIn = normalizeHHMM(incomingSettings.timeIn, AppState.settings.timeIn);
                         if (incomingSettings.timeOut) incomingSettings.timeOut = normalizeHHMM(incomingSettings.timeOut, AppState.settings.timeOut);
@@ -1861,7 +1864,7 @@
             `;
 
             // Update logos if custom logo uploaded or pasted
-            const validLogo = s.logoUrl && !s.logoUrl.startsWith('[FOTO_') ? s.logoUrl : '';
+            const validLogo = normalizeLogoUrl(s.logoUrl);
             const logoTargets = [
                 { id: 'login-school-logo-box', icon: '<i class="fa-solid fa-school text-3xl text-sky-300"></i>' },
                 { id: 'header-logo-box', icon: '<i class="fa-solid fa-school text-sky-300 text-lg"></i>' },
@@ -1872,7 +1875,7 @@
                 const box = document.getElementById(t.id);
                 if (!box) return;
                 if (validLogo) {
-                    box.innerHTML = `<img src="${validLogo}" alt="Logo Sekolah" onerror="this.parentElement.innerHTML='${t.icon.replace(/"/g, '&quot;')}'" class="w-full h-full object-contain bg-white p-1">`;
+                    box.innerHTML = `<img src="${validLogo}" referrerpolicy="no-referrer" alt="Logo Sekolah" onerror="this.parentElement.innerHTML='${t.icon.replace(/"/g, '&quot;')}'" class="w-full h-full object-contain bg-white p-1">`;
                 } else {
                     box.innerHTML = t.icon;
                 }
@@ -3215,9 +3218,24 @@
             `).join('');
         }
 
+        window.normalizeLogoUrl = function(rawUrl) {
+            const url = (rawUrl || '').trim();
+            if (!url || url.startsWith('[FOTO_')) return '';
+            // Auto-convert Google Drive sharing links to direct image links readable on all mobile browsers
+            const driveFileMatch = url.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/);
+            if (driveFileMatch) {
+                return `https://lh3.googleusercontent.com/d/${driveFileMatch[1]}=s300`;
+            }
+            const driveOpenMatch = url.match(/drive\.google\.com\/(?:open|uc)\?.*id=([a-zA-Z0-9_-]+)/);
+            if (driveOpenMatch) {
+                return `https://lh3.googleusercontent.com/d/${driveOpenMatch[1]}=s300`;
+            }
+            return url;
+        };
+
         function handleLogoUrlInput(val) {
-            const trimmed = (val || '').trim();
-            AppState.settings.logoUrl = trimmed;
+            const normalized = normalizeLogoUrl(val);
+            AppState.settings.logoUrl = normalized;
             applySchoolBranding();
         }
 
@@ -3238,25 +3256,46 @@
             reader.onload = (evt) => {
                 const img = new Image();
                 img.onload = () => {
-                    // Resize & compress logo to max 180x180 so Base64 stays < 25KB and syncs cleanly to Google Sheets
-                    const maxDim = 180;
-                    let w = img.width;
-                    let h = img.height;
-                    if (w > maxDim || h > maxDim) {
-                        if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
-                        else { w = Math.round(w * maxDim / h); h = maxDim; }
+                    // Adaptive compression so Base64 is strictly < 35,000 chars and syncs 100% to Google Sheets & all mobile phones
+                    const sizes = [140, 110, 88];
+                    let bestDataUrl = '';
+                    for (const maxDim of sizes) {
+                        let w = img.width;
+                        let h = img.height;
+                        if (w > maxDim || h > maxDim) {
+                            if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
+                            else { w = Math.round(w * maxDim / h); h = maxDim; }
+                        }
+                        const canvas = document.createElement('canvas');
+                        canvas.width = w;
+                        canvas.height = h;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, w, h);
+
+                        // Try WebP first (supports transparency & tiny size), then PNG, then JPEG
+                        const webp = canvas.toDataURL('image/webp', 0.82);
+                        if (webp.length < 35000) { bestDataUrl = webp; break; }
+                        const png = canvas.toDataURL('image/png');
+                        if (png.length < 35000) { bestDataUrl = png; break; }
+
+                        // Fill white background for JPEG fallback
+                        const jpgCanvas = document.createElement('canvas');
+                        jpgCanvas.width = w;
+                        jpgCanvas.height = h;
+                        const jCtx = jpgCanvas.getContext('2d');
+                        jCtx.fillStyle = '#FFFFFF';
+                        jCtx.fillRect(0, 0, w, h);
+                        jCtx.drawImage(img, 0, 0, w, h);
+                        const jpg = jpgCanvas.toDataURL('image/jpeg', 0.78);
+                        if (jpg.length < 35000) { bestDataUrl = jpg; break; }
+                        bestDataUrl = jpg;
                     }
-                    const canvas = document.createElement('canvas');
-                    canvas.width = w;
-                    canvas.height = h;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0, w, h);
-                    const compressedDataUrl = canvas.toDataURL('image/png');
-                    AppState.settings.logoUrl = compressedDataUrl;
+
+                    AppState.settings.logoUrl = bestDataUrl;
                     const urlInp = document.getElementById('set-school-logo-url');
-                    if (urlInp) urlInp.value = compressedDataUrl;
+                    if (urlInp) urlInp.value = bestDataUrl;
                     applySchoolBranding();
-                    showToast('Logo berhasil dimuat! Klik "Simpan Semua Pengaturan" di bawah untuk menyimpan permanen.', 'success');
+                    showToast('Logo berhasil dikompresi & dimuat! Klik "Simpan Semua Pengaturan" agar muncul di semua HP.', 'success');
                 };
                 img.src = evt.target.result;
             };
@@ -3289,7 +3328,7 @@
                     return;
                 }
 
-                const logoUrlVal = (document.getElementById('set-school-logo-url')?.value || AppState.settings.logoUrl || '').trim();
+                const logoUrlVal = normalizeLogoUrl(document.getElementById('set-school-logo-url')?.value || AppState.settings.logoUrl || '');
                 const latRaw = String(document.getElementById('set-gps-lat').value || '-6.88685').replace(',', '.');
                 const lngRaw = String(document.getElementById('set-gps-lng').value || '113.27215').replace(',', '.');
 
